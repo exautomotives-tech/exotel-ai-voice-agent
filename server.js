@@ -11,6 +11,15 @@ const MODEL =
   process.env.GEMINI_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
 
+function geminiUrl() {
+  return (
+    "wss://generativelanguage.googleapis.com/ws/" +
+    "google.ai.generativelanguage.v1beta.GenerativeService." +
+    "BidiGenerateContent?key=" +
+    encodeURIComponent(API_KEY || "")
+  );
+}
+
 app.get("/", (_req, res) => {
   res.json({
     service: "EbykeShop AI Voice Agent",
@@ -25,6 +34,123 @@ app.get("/health", (_req, res) => {
     apiKeyConfigured: Boolean(API_KEY),
     streamTokenConfigured: Boolean(STREAM_TOKEN),
   });
+});
+
+// Temporary diagnostic endpoint.
+// Protect it with the stream token. Do not share its URL.
+app.get("/gemini-check", (req, res) => {
+  if (!STREAM_TOKEN || req.query.token !== STREAM_TOKEN) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  if (!API_KEY) {
+    return res.status(500).json({
+      ok: false,
+      error: "GEMINI_API_KEY is missing",
+    });
+  }
+
+  let finished = false;
+  let geminiWs;
+
+  const timeout = setTimeout(() => {
+    finish(504, {
+      ok: false,
+      error: "Gemini connection timed out",
+      model: MODEL,
+    });
+  }, 15000);
+
+  function finish(status, body) {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+
+    if (
+      geminiWs &&
+      (geminiWs.readyState === WebSocket.OPEN ||
+        geminiWs.readyState === WebSocket.CONNECTING)
+    ) {
+      geminiWs.close();
+    }
+
+    if (!res.headersSent) {
+      res.status(status).json(body);
+    }
+  }
+
+  try {
+    geminiWs = new WebSocket(geminiUrl());
+
+    geminiWs.on("open", () => {
+      geminiWs.send(
+        JSON.stringify({
+          setup: {
+            model: `models/${MODEL}`,
+            generationConfig: {
+              responseModalities: ["AUDIO"],
+            },
+          },
+        })
+      );
+    });
+
+    geminiWs.on("message", (raw) => {
+      let message;
+
+      try {
+        message = JSON.parse(raw.toString());
+      } catch {
+        finish(502, {
+          ok: false,
+          error: "Gemini returned an unreadable response",
+        });
+        return;
+      }
+
+      if (message.setupComplete) {
+        finish(200, {
+          ok: true,
+          message: "Gemini connection and model setup succeeded",
+          model: MODEL,
+        });
+        return;
+      }
+
+      if (message.error) {
+        finish(502, {
+          ok: false,
+          error: message.error.message || "Gemini API error",
+          model: MODEL,
+        });
+      }
+    });
+
+    geminiWs.on("error", () => {
+      finish(502, {
+        ok: false,
+        error:
+          "Could not connect to Gemini. Check the API key, model, " +
+          "API access, and Render logs.",
+        model: MODEL,
+      });
+    });
+
+    geminiWs.on("close", () => {
+      if (!finished) {
+        finish(502, {
+          ok: false,
+          error: "Gemini closed the connection before setup completed",
+          model: MODEL,
+        });
+      }
+    });
+  } catch {
+    finish(502, {
+      ok: false,
+      error: "Could not start the Gemini connection test",
+    });
+  }
 });
 
 const server = app.listen(PORT, "0.0.0.0", () => {
@@ -61,12 +187,11 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
-// Exotel audio is assumed to be raw 8 kHz, signed 16-bit,
-// mono PCM, little-endian. Confirm this in the Exotel configuration.
+// Assumes Exotel sends raw 8 kHz, signed 16-bit,
+// mono PCM, little-endian audio. Verify the actual stream format.
 function upsample8kTo16k(base64) {
   const input = Buffer.from(base64, "base64");
-  const usableLength = input.length - (input.length % 2);
-  const count = usableLength / 2;
+  const count = Math.floor(input.length / 2);
 
   if (count === 0) return "";
 
@@ -75,7 +200,9 @@ function upsample8kTo16k(base64) {
   for (let i = 0; i < count; i++) {
     const current = input.readInt16LE(i * 2);
     const next =
-      i + 1 < count ? input.readInt16LE((i + 1) * 2) : current;
+      i + 1 < count
+        ? input.readInt16LE((i + 1) * 2)
+        : current;
 
     output.writeInt16LE(current, i * 4);
     output.writeInt16LE(
@@ -87,20 +214,19 @@ function upsample8kTo16k(base64) {
   return output.toString("base64");
 }
 
-// Approximate 24 kHz -> 8 kHz decimation.
-// Keep sample groups across Gemini audio chunks.
+// Approximate 24 kHz -> 8 kHz conversion.
+// This is prototype-quality resampling, not production DSP.
 function createDownsampler() {
   let pending = [];
 
   return function downsample(base64) {
     const input = Buffer.from(base64, "base64");
-    const usableLength = input.length - (input.length % 2);
 
-    for (let i = 0; i < usableLength; i += 2) {
+    for (let i = 0; i + 1 < input.length; i += 2) {
       pending.push(input.readInt16LE(i));
     }
 
-    const outputSamples = [];
+    const samples = [];
     let index = 0;
 
     while (index + 2 < pending.length) {
@@ -111,7 +237,7 @@ function createDownsampler() {
           3
       );
 
-      outputSamples.push(
+      samples.push(
         Math.max(-32768, Math.min(32767, average))
       );
       index += 3;
@@ -119,9 +245,9 @@ function createDownsampler() {
 
     pending = pending.slice(index);
 
-    const output = Buffer.alloc(outputSamples.length * 2);
+    const output = Buffer.alloc(samples.length * 2);
 
-    outputSamples.forEach((sample, i) => {
+    samples.forEach((sample, i) => {
       output.writeInt16LE(sample, i * 2);
     });
 
@@ -145,14 +271,7 @@ wss.on("connection", (exotelWs) => {
 
   const pendingAudio = [];
   const downsampleAudio = createDownsampler();
-
-  const geminiUrl =
-    "wss://generativelanguage.googleapis.com/ws/" +
-    "google.ai.generativelanguage.v1beta.GenerativeService." +
-    "BidiGenerateContent?key=" +
-    encodeURIComponent(API_KEY);
-
-  const geminiWs = new WebSocket(geminiUrl);
+  const geminiWs = new WebSocket(geminiUrl());
 
   function sendGemini(message) {
     if (geminiWs.readyState === WebSocket.OPEN) {
@@ -207,16 +326,15 @@ wss.on("connection", (exotelWs) => {
             {
               text:
                 "You are a polite, friendly AI sales assistant calling " +
-                "on behalf of E byke Shop, an electric bicycle store in " +
+                "on behalf of EbykeShop, an electric bicycle store in " +
                 "Bangalore, India. Identify yourself as an AI assistant. " +
-                "Speak naturally in conversational English, without " +
-                "forced slang. Ask permission before continuing. If the " +
-                "caller agrees, ask one question at a time about their " +
-                "interest in an electric bicycle, who will use it, its " +
-                "main purpose, expected purchase timeline, and approximate " +
-                "budget in Indian rupees. Listen before asking the next " +
-                "question. Respect refusals and end politely. Never claim " +
-                "an order or purchase is confirmed. Do not request " +
+                "Speak naturally in conversational English. Ask permission " +
+                "before continuing. If the caller agrees, ask one question " +
+                "at a time about their interest in an electric bicycle, " +
+                "who will use it, its main purpose, expected purchase " +
+                "timeline, and approximate budget in Indian rupees. Listen " +
+                "before asking the next question. Respect refusals and end " +
+                "politely. Never claim an order is confirmed. Do not request " +
                 "sensitive personal information. This is a test call.",
             },
           ],
@@ -257,7 +375,6 @@ wss.on("connection", (exotelWs) => {
       if (!part.inlineData?.data) continue;
 
       const mimeType = part.inlineData.mimeType || "";
-
       if (!mimeType.includes("audio/pcm")) continue;
 
       const exotelAudio = downsampleAudio(part.inlineData.data);
@@ -265,16 +382,11 @@ wss.on("connection", (exotelWs) => {
     }
 
     if (message.serverContent?.interrupted) {
-      // Exotel clear-message support must be confirmed for your
-      // Voicebot Applet before enabling interruption handling.
       console.log("Gemini reported an interruption");
     }
 
     if (message.error) {
-      console.error(
-        "Gemini API error:",
-        JSON.stringify(message.error)
-      );
+      console.error("Gemini API error:", JSON.stringify(message.error));
     }
 
     if (message.goAway) {
