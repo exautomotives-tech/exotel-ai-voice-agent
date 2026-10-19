@@ -16,6 +16,7 @@ app.get("/", (_req, res) => {
     service: "EbykeShop AI Voice Agent",
     status: "running",
     websocket: "/media",
+    mode: "temporary-connection-test",
   });
 });
 
@@ -29,6 +30,7 @@ app.get("/health", (_req, res) => {
 
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`Voice agent listening on port ${PORT}`);
+  console.log("TEMPORARY TEST MODE: token validation is disabled");
 });
 
 const wss = new WebSocketServer({ noServer: true });
@@ -37,47 +39,28 @@ server.on("upgrade", (req, socket, head) => {
   console.log("WebSocket upgrade request received");
 
   let pathname;
-  let token;
 
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     pathname = url.pathname;
-    token = url.searchParams.get("token");
-  } catch (error) {
+  } catch {
     console.error("Invalid WebSocket request URL");
     socket.destroy();
     return;
   }
 
-  console.log("WebSocket request details:", {
-    pathname,
-    tokenProvided: Boolean(token),
-    streamTokenConfigured: Boolean(STREAM_TOKEN),
-    tokenMatches: Boolean(
-      token && STREAM_TOKEN && token === STREAM_TOKEN
-    ),
-  });
+  console.log("WebSocket request path:", pathname);
 
-  if (
-    pathname !== "/media" ||
-    !STREAM_TOKEN ||
-    token !== STREAM_TOKEN
-  ) {
-    console.error("WebSocket request rejected:", {
-      reason:
-        pathname !== "/media"
-          ? "Incorrect WebSocket path"
-          : !STREAM_TOKEN
-            ? "Server stream token is not configured"
-            : "Missing or mismatched token",
-    });
-
-    if (!socket.destroyed) {
-      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-      socket.destroy();
-    }
+  // TEMPORARY TEST ONLY: authentication is disabled.
+  // Restore token validation immediately after the test.
+  if (pathname !== "/media") {
+    console.error("WebSocket rejected: incorrect path");
+    socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+    socket.destroy();
     return;
   }
+
+  console.warn("TEST MODE: accepting WebSocket without token");
 
   wss.handleUpgrade(req, socket, head, (ws) => {
     console.log("WebSocket handshake succeeded");
@@ -127,13 +110,13 @@ function createDownsampler() {
       const average = Math.round(
         (pending[index] +
           pending[index + 1] +
-          pending[index + 2]) /
-          3
+          pending[index + 2]) / 3
       );
 
       samples.push(
         Math.max(-32768, Math.min(32767, average))
       );
+
       index += 3;
     }
 
