@@ -34,6 +34,8 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
+  console.log("WebSocket upgrade request received");
+
   let pathname;
   let token;
 
@@ -41,28 +43,48 @@ server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     pathname = url.pathname;
     token = url.searchParams.get("token");
-  } catch {
+  } catch (error) {
+    console.error("Invalid WebSocket request URL");
     socket.destroy();
     return;
   }
+
+  console.log("WebSocket request details:", {
+    pathname,
+    tokenProvided: Boolean(token),
+    streamTokenConfigured: Boolean(STREAM_TOKEN),
+    tokenMatches: Boolean(
+      token && STREAM_TOKEN && token === STREAM_TOKEN
+    ),
+  });
 
   if (
     pathname !== "/media" ||
     !STREAM_TOKEN ||
     token !== STREAM_TOKEN
   ) {
-    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    socket.destroy();
+    console.error("WebSocket request rejected:", {
+      reason:
+        pathname !== "/media"
+          ? "Incorrect WebSocket path"
+          : !STREAM_TOKEN
+            ? "Server stream token is not configured"
+            : "Missing or mismatched token",
+    });
+
+    if (!socket.destroyed) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+    }
     return;
   }
 
   wss.handleUpgrade(req, socket, head, (ws) => {
+    console.log("WebSocket handshake succeeded");
     wss.emit("connection", ws, req);
   });
 });
 
-// Assumes Exotel sends raw 8 kHz, signed 16-bit,
-// mono PCM, little-endian audio. Verify this format with Exotel.
 function upsample8kTo16k(base64) {
   const input = Buffer.from(base64, "base64");
   const count = Math.floor(input.length / 2);
@@ -88,8 +110,6 @@ function upsample8kTo16k(base64) {
   return output.toString("base64");
 }
 
-// Approximate 24 kHz -> 8 kHz conversion.
-// This is prototype-quality resampling, not production DSP.
 function createDownsampler() {
   let pending = [];
 
@@ -142,6 +162,7 @@ wss.on("connection", (exotelWs) => {
   let geminiReady = false;
   let greetingSent = false;
   let closed = false;
+  let mediaEventsLogged = 0;
 
   const pendingAudio = [];
   const downsampleAudio = createDownsampler();
@@ -180,7 +201,9 @@ wss.on("connection", (exotelWs) => {
 
   function sendGreeting() {
     if (greetingSent || !geminiReady) return;
+
     greetingSent = true;
+    console.log("Sending initial greeting request to Gemini");
 
     sendGemini({
       realtimeInput: {
@@ -227,6 +250,8 @@ wss.on("connection", (exotelWs) => {
         },
       },
     });
+
+    console.log("Gemini setup message sent");
   });
 
   geminiWs.on("message", (raw) => {
@@ -250,12 +275,20 @@ wss.on("connection", (exotelWs) => {
       sendGreeting();
     }
 
+    if (message.error) {
+      console.error(
+        "Gemini API error:",
+        JSON.stringify(message.error)
+      );
+    }
+
     const parts = message.serverContent?.modelTurn?.parts || [];
 
     for (const part of parts) {
       if (!part.inlineData?.data) continue;
 
       const mimeType = part.inlineData.mimeType || "";
+
       if (!mimeType.includes("audio/pcm")) continue;
 
       const exotelAudio = downsampleAudio(part.inlineData.data);
@@ -264,10 +297,6 @@ wss.on("connection", (exotelWs) => {
 
     if (message.serverContent?.interrupted) {
       console.log("Gemini reported an interruption");
-    }
-
-    if (message.error) {
-      console.error("Gemini API error:", JSON.stringify(message.error));
     }
 
     if (message.goAway) {
@@ -279,8 +308,12 @@ wss.on("connection", (exotelWs) => {
     console.error("Gemini WebSocket error:", error.message);
   });
 
-  geminiWs.on("close", (code) => {
-    console.log("Gemini WebSocket closed:", code);
+  geminiWs.on("close", (code, reason) => {
+    console.log(
+      "Gemini WebSocket closed:",
+      code,
+      reason.toString()
+    );
 
     if (!closed && exotelWs.readyState === WebSocket.OPEN) {
       exotelWs.close(1011, "AI session ended");
@@ -297,6 +330,10 @@ wss.on("connection", (exotelWs) => {
       return;
     }
 
+    if (event.event === "connected") {
+      console.log("Exotel connected event received");
+    }
+
     if (event.event === "start") {
       streamSid =
         event.start?.stream_sid ||
@@ -304,10 +341,18 @@ wss.on("connection", (exotelWs) => {
         event.stream_sid ||
         null;
 
-      console.log("Exotel stream started");
+      console.log("Exotel stream started", {
+        streamSidReceived: Boolean(streamSid),
+      });
     }
 
     if (event.event === "media" && event.media?.payload) {
+      mediaEventsLogged++;
+
+      if (mediaEventsLogged === 1) {
+        console.log("First Exotel audio event received");
+      }
+
       const audio16k = upsample8kTo16k(event.media.payload);
 
       if (geminiReady) {
@@ -333,9 +378,14 @@ wss.on("connection", (exotelWs) => {
     }
   });
 
-  exotelWs.on("close", () => {
+  exotelWs.on("close", (code, reason) => {
     closed = true;
-    console.log("Exotel WebSocket closed");
+
+    console.log(
+      "Exotel WebSocket closed:",
+      code,
+      reason.toString()
+    );
 
     if (
       geminiWs.readyState === WebSocket.OPEN ||
@@ -348,4 +398,8 @@ wss.on("connection", (exotelWs) => {
   exotelWs.on("error", (error) => {
     console.error("Exotel WebSocket error:", error.message);
   });
+});
+
+server.on("error", (error) => {
+  console.error("HTTP server error:", error.message);
 });
