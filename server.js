@@ -295,7 +295,7 @@ RESPONSE SPEED:
           automaticActivityDetection: {
             disabled: false,
             endOfSpeechSensitivity: "END_SENSITIVITY_HIGH",
-            silenceDurationMs: 300,
+            silenceDurationMs: 100,
             prefixPaddingMs: 20
           },
           activityHandling: "START_OF_ACTIVITY_INTERRUPTS"
