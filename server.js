@@ -11,15 +11,6 @@ const MODEL =
   process.env.GEMINI_MODEL ||
   "gemini-2.5-flash-native-audio-preview-12-2025";
 
-function geminiUrl() {
-  return (
-    "wss://generativelanguage.googleapis.com/ws/" +
-    "google.ai.generativelanguage.v1beta.GenerativeService." +
-    "BidiGenerateContent?key=" +
-    encodeURIComponent(API_KEY || "")
-  );
-}
-
 app.get("/", (_req, res) => {
   res.json({
     service: "EbykeShop AI Voice Agent",
@@ -34,123 +25,6 @@ app.get("/health", (_req, res) => {
     apiKeyConfigured: Boolean(API_KEY),
     streamTokenConfigured: Boolean(STREAM_TOKEN),
   });
-});
-
-// Temporary diagnostic endpoint.
-// Protect it with the stream token. Do not share its URL.
-app.get("/gemini-check", (req, res) => {
-  if (!STREAM_TOKEN || req.query.token !== STREAM_TOKEN) {
-    return res.status(403).json({ error: "Forbidden" });
-  }
-
-  if (!API_KEY) {
-    return res.status(500).json({
-      ok: false,
-      error: "GEMINI_API_KEY is missing",
-    });
-  }
-
-  let finished = false;
-  let geminiWs;
-
-  const timeout = setTimeout(() => {
-    finish(504, {
-      ok: false,
-      error: "Gemini connection timed out",
-      model: MODEL,
-    });
-  }, 15000);
-
-  function finish(status, body) {
-    if (finished) return;
-    finished = true;
-    clearTimeout(timeout);
-
-    if (
-      geminiWs &&
-      (geminiWs.readyState === WebSocket.OPEN ||
-        geminiWs.readyState === WebSocket.CONNECTING)
-    ) {
-      geminiWs.close();
-    }
-
-    if (!res.headersSent) {
-      res.status(status).json(body);
-    }
-  }
-
-  try {
-    geminiWs = new WebSocket(geminiUrl());
-
-    geminiWs.on("open", () => {
-      geminiWs.send(
-        JSON.stringify({
-          setup: {
-            model: `models/${MODEL}`,
-            generationConfig: {
-              responseModalities: ["AUDIO"],
-            },
-          },
-        })
-      );
-    });
-
-    geminiWs.on("message", (raw) => {
-      let message;
-
-      try {
-        message = JSON.parse(raw.toString());
-      } catch {
-        finish(502, {
-          ok: false,
-          error: "Gemini returned an unreadable response",
-        });
-        return;
-      }
-
-      if (message.setupComplete) {
-        finish(200, {
-          ok: true,
-          message: "Gemini connection and model setup succeeded",
-          model: MODEL,
-        });
-        return;
-      }
-
-      if (message.error) {
-        finish(502, {
-          ok: false,
-          error: message.error.message || "Gemini API error",
-          model: MODEL,
-        });
-      }
-    });
-
-    geminiWs.on("error", () => {
-      finish(502, {
-        ok: false,
-        error:
-          "Could not connect to Gemini. Check the API key, model, " +
-          "API access, and Render logs.",
-        model: MODEL,
-      });
-    });
-
-    geminiWs.on("close", () => {
-      if (!finished) {
-        finish(502, {
-          ok: false,
-          error: "Gemini closed the connection before setup completed",
-          model: MODEL,
-        });
-      }
-    });
-  } catch {
-    finish(502, {
-      ok: false,
-      error: "Could not start the Gemini connection test",
-    });
-  }
 });
 
 const server = app.listen(PORT, "0.0.0.0", () => {
@@ -188,7 +62,7 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 // Assumes Exotel sends raw 8 kHz, signed 16-bit,
-// mono PCM, little-endian audio. Verify the actual stream format.
+// mono PCM, little-endian audio. Verify this format with Exotel.
 function upsample8kTo16k(base64) {
   const input = Buffer.from(base64, "base64");
   const count = Math.floor(input.length / 2);
@@ -271,7 +145,14 @@ wss.on("connection", (exotelWs) => {
 
   const pendingAudio = [];
   const downsampleAudio = createDownsampler();
-  const geminiWs = new WebSocket(geminiUrl());
+
+  const geminiUrl =
+    "wss://generativelanguage.googleapis.com/ws/" +
+    "google.ai.generativelanguage.v1beta.GenerativeService." +
+    "BidiGenerateContent?key=" +
+    encodeURIComponent(API_KEY);
+
+  const geminiWs = new WebSocket(geminiUrl);
 
   function sendGemini(message) {
     if (geminiWs.readyState === WebSocket.OPEN) {
